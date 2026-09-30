@@ -4,7 +4,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import db from '../utils/test-db.js';
+import db from '../utils/db.js';
 import { getIO } from '../utils/socket-io.js';
 
 const router = express.Router();
@@ -17,8 +17,7 @@ const RECOGNIZE_SCRIPT =
 const TEST_CLIP =
   process.env.CCTV_TEST_CLIP || path.resolve(__dirname, '../f310.avi');
 const ANNOTATED_DIR =
-  process.env.CCTV_ANNOTATED_DIR ||
-  path.resolve(__dirname, '../outputs/annotated');
+  process.env.CCTV_ANNOTATED_DIR || path.resolve(__dirname, '../results');
 const RECOGNIZE_TIMEOUT_MS = Number(
   process.env.CCTV_RECOGNIZE_TIMEOUT_MS || 60_000,
 );
@@ -57,15 +56,12 @@ router.post('/run', async (req, res) => {
     );
     const rosterPath = path.join(tempDir, 'roster.json');
     const resultPath = path.join(tempDir, 'result.json');
-    const annotatedPath = path.join(
-      ANNOTATED_DIR,
-      `${sessionCode}-${Date.now()}.jpg`,
-    );
+    const annotatedPath = path.join(ANNOTATED_DIR, `${sessionCode}.jpg`);
 
     await fs.writeFile(rosterPath, JSON.stringify(roster, null, 2), 'utf8');
 
     // Stable per room: everyone sharing a room shares one cache, whatever period it is.
-    const cacheKey = `room_${context.room_id}`;
+    const cacheKey = `${context.block}_${context.room_number}`;
 
     const args = [
       RECOGNIZE_SCRIPT,
@@ -87,24 +83,6 @@ router.post('/run', async (req, res) => {
     console.log(output);
 
     const present = output.present_students || [];
-    const timestamp = new Date().toLocaleString();
-    const io = getIO();
-
-    for (const student of present) {
-      await insertAttendance(context.session_id, student.student_id, timestamp);
-
-      const dbStudent = allStudents.find(
-        s => String(s.id) === String(student.student_id),
-      );
-      io.to(sessionCode).emit('attendance_update', {
-        studentId: student.student_id,
-        studentName: dbStudent?.name || String(student.student_id),
-        sessionCode,
-        time: timestamp,
-        method: 'cctv',
-        score: student.best_score,
-      });
-    }
 
     await fs.rm(tempDir, { recursive: true, force: true });
 
@@ -113,6 +91,10 @@ router.post('/run', async (req, res) => {
       sessionCode,
       timetableId: context.timetable_id,
       presentStudents: present,
+      students: allStudents.map(student => ({
+        id: student.id,
+        name: student.name,
+      })),
       annotatedImage: output.annotated_image || null,
       python: {
         stdout: result.stdout,
@@ -136,9 +118,12 @@ function getSessionContext(sessionCode) {
       SELECT
         sessions.id AS session_id,
         sessions.timetable_id,
-        timetable.room_id
+        timetable.room_id,
+        rooms.block,
+        rooms.room_number
       FROM sessions
       JOIN timetable ON timetable.id = sessions.timetable_id
+      JOIN rooms on rooms.id = timetable.room_id
       WHERE sessions.session_code = ?
       LIMIT 1
       `,
@@ -168,23 +153,6 @@ function getStudentsForRoom(roomId) {
       `,
       [roomId],
       (err, rows) => (err ? reject(err) : resolve(rows)),
-    );
-  });
-}
-
-function insertAttendance(sessionId, studentId, timestamp) {
-  return new Promise((resolve, reject) => {
-    db.run(
-      `
-      INSERT OR IGNORE INTO attendance
-        (session_id, student_id, status, timestamp)
-      VALUES (?, ?, 'present', ?)
-      `,
-      [sessionId, studentId, timestamp],
-      function (err) {
-        if (err) return reject(err);
-        resolve(this.changes);
-      },
     );
   });
 }
